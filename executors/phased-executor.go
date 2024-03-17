@@ -3,7 +3,6 @@ package executors
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,6 +17,10 @@ type phasedExecutor struct {
 	stages []Stage
 	status executorStatus
 	mu sync.Mutex
+	startedIterations uint64
+	requestCount uint64
+	errorCount uint64
+	wg sync.WaitGroup
 }
 
 func (e *phasedExecutor) Run(ctx context.Context, fn func(chan bool) error) (ExecutorStats, error) {
@@ -30,11 +33,7 @@ func (e *phasedExecutor) Run(ctx context.Context, fn func(chan bool) error) (Exe
 	e.status = running
 	e.mu.Unlock()
 	
-	defer func() {
-		e.mu.Lock()
-		e.status = stopped
-		e.mu.Unlock()
-	}()
+	defer e.resetState()
 
 	// Create a new context to handle exit signals
 	ctx, cancel := context.WithCancel(ctx)
@@ -44,46 +43,17 @@ func (e *phasedExecutor) Run(ctx context.Context, fn func(chan bool) error) (Exe
 	go exitSignalsHandler(ctx, e)	
 	
 	expectedIterations, expectedRequests := e.calculateExpectations(e.stages)
-	
-	var wg sync.WaitGroup
-	var requestCount, errorCount uint64
-	completedChannel := make(chan bool)
 
-	fmt.Println("Starting executor...")
+	e.run(ctx, fn, make(chan bool), expectedIterations, 0)	
 
-	LOOP:
-		for _, stage := range e.stages {			
-			e.mu.Lock()
-			if (ctx.Err() != nil || e.status == stopped) {
-				defer e.mu.Unlock()
-				break LOOP
-			}
-			e.mu.Unlock()
-			
-			select {
-				case <-completedChannel:
-					break LOOP
-				default:
-					wg.Add(1)
-					go func (ctx context.Context, s Stage) {
-						defer wg.Done()
-						iterationStats := e.runStage(ctx, s, func() error { return fn(completedChannel) })
-						atomic.AddUint64(&requestCount, iterationStats.requestCount)
-						atomic.AddUint64(&errorCount, iterationStats.errorCount)
-					}(ctx, stage)
-					
-					time.Sleep(stage.Duration)		
-			}
-		}
-
-	wg.Wait()
+	e.wg.Wait()
 
 	return ExecutorStats{
 		ExpectedIterations: expectedIterations,
+		ExecutedIterations: e.startedIterations,
 		ExpectedRequests: expectedRequests,
-		ExecutedIterations: expectedIterations,
-		ExecutedRequests: requestCount,
-		Errors: errorCount,
+		ExecutedRequests: e.requestCount,
+		Errors: e.errorCount,
 	}, nil
 }
 
@@ -108,6 +78,42 @@ func (e *phasedExecutor) calculateExpectations(stages []Stage) (uint64, uint64) 
 		expectedRequests += stage.RequestPerSeccond * durationsInMs
 	}
 	return expectedIterations, expectedRequests
+}
+
+func (e *phasedExecutor) resetState() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.startedIterations = 0
+	e.requestCount = 0
+	e.errorCount = 0
+	e.wg = sync.WaitGroup{}
+}
+
+func (e *phasedExecutor) run(ctx context.Context, fn func(chan bool) error, completedChannel chan bool, expectedIterations uint64, stageNumber int) error {
+
+	e.mu.Lock()
+	if (ctx.Err() != nil || e.status == stopped) {
+		return nil
+	}
+	e.mu.Unlock()
+
+	
+	if stageNumber > (len(e.stages) - 1) {
+		return nil
+	}
+
+	stage := e.stages[stageNumber]
+	e.wg.Add(1)
+	go func (ctx context.Context, s Stage) {
+	defer e.wg.Done()
+		iterationStats := e.runStage(ctx, s, func() error { return fn(completedChannel) })
+		atomic.AddUint64(&e.requestCount, iterationStats.requestCount)
+		atomic.AddUint64(&e.errorCount, iterationStats.errorCount)
+	}(ctx, stage)
+
+	time.Sleep(stage.Duration)
+
+	return e.run(ctx, fn, completedChannel, expectedIterations, stageNumber + 1)
 }
 
 func (e *phasedExecutor) runStage(ctx context.Context, stage Stage, fn func() error) iterationStats {

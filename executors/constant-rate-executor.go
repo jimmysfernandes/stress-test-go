@@ -13,6 +13,10 @@ type constantRateExecutor struct {
 	requestPerSeccond uint64
 	status executorStatus
 	mu sync.Mutex
+	startedIterations uint64
+	requestCount uint64
+	errorCount uint64
+	wg sync.WaitGroup
 }
 
 func (e *constantRateExecutor) Run(ctx context.Context, fn func(chan bool) error) (ExecutorStats, error) {
@@ -21,14 +25,11 @@ func (e *constantRateExecutor) Run(ctx context.Context, fn func(chan bool) error
 		defer e.mu.Unlock()
 		return ExecutorStats{}, errors.New("executor is already running")
 	}
+	// Reset stats
 	e.status = running
 	e.mu.Unlock()
 	
-	defer func() {
-		e.mu.Lock()
-		e.status = stopped
-		e.mu.Unlock()
-	}()
+	defer e.resetState()
 
 	// Create a new context to handle exit signals
 	ctx, cancel := context.WithCancel(ctx)
@@ -40,45 +41,16 @@ func (e *constantRateExecutor) Run(ctx context.Context, fn func(chan bool) error
 	expectedIterations := calculateExpectedIterations(e.duration)
 	expectedRequests := calculateExpectedRequests(e.duration, e.requestPerSeccond)
 
-	ticker := time.NewTicker(1 * time.Second)
-
-	var wg sync.WaitGroup
-	var startedIterations, requestCount, errorCount uint64
-	completedChannel := make(chan bool)
-
-	LOOP:
-		for {
-			e.mu.Lock()
-			if (ctx.Err() != nil || e.status == stopped || e.isCompleted(startedIterations, expectedIterations)) {
-				defer e.mu.Unlock()
-				break LOOP
-			}
-			e.mu.Unlock()
-			select {
-				case <-ctx.Done():
-					break LOOP
-				case <-completedChannel:
-					break LOOP
-				case <-ticker.C:
-					wg.Add(1)
-					atomic.AddUint64(&startedIterations, 1)
-					go func () {
-						defer wg.Done()
-						iterationStats := runIteration(ctx, e.requestPerSeccond, func() error { return fn(completedChannel) })
-						atomic.AddUint64(&requestCount, iterationStats.requestCount)
-						atomic.AddUint64(&errorCount, iterationStats.errorCount)
-					}()
-			}
-		}
+	e.run(ctx, fn, make(chan bool), expectedIterations)
 	
-	wg.Wait()
+	e.wg.Wait()
 
 	return ExecutorStats{
 		ExpectedIterations: expectedIterations,
-		ExecutedIterations: startedIterations,
+		ExecutedIterations: e.startedIterations,
 		ExpectedRequests: expectedRequests,
-		ExecutedRequests: requestCount,
-		Errors: errorCount,
+		ExecutedRequests: e.requestCount,
+		Errors: e.errorCount,
 	}, nil
 }
 
@@ -94,8 +66,43 @@ func (e *constantRateExecutor) Stop() error {
 	return nil
 }
 
-func (e *constantRateExecutor) isCompleted(startedIterations uint64, expectedIterations uint64) bool {
-	return startedIterations >= expectedIterations
+func (e *constantRateExecutor) resetState() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.startedIterations = 0
+	e.requestCount = 0
+	e.errorCount = 0
+	e.wg = sync.WaitGroup{}
+}
+
+func (e *constantRateExecutor) run(ctx context.Context, fn func(chan bool) error, completedChannel chan bool, expectedIterations uint64) error {
+	
+	e.mu.Lock()
+	if (ctx.Err() != nil || e.status == stopped || e.startedIterations >= expectedIterations) {
+		defer e.mu.Unlock()
+		return nil
+	}
+	e.mu.Unlock()
+	
+	select {
+		case <-ctx.Done():
+			return nil
+		case <-completedChannel:
+			return nil
+		default:
+			e.wg.Add(1)
+			atomic.AddUint64(&e.startedIterations, 1)
+			go func () {
+				defer e.wg.Done()
+				iterationStats := runIteration(ctx, e.requestPerSeccond, func() error { return fn(completedChannel) })
+				atomic.AddUint64(&e.requestCount, iterationStats.requestCount)
+				atomic.AddUint64(&e.errorCount, iterationStats.errorCount)
+			}()
+	}
+
+	time.Sleep(1 * time.Second)
+
+	return e.run(ctx, fn, completedChannel, expectedIterations)
 }
 
 func NewFixedExecutor(duration time.Duration, requestPerSeccond uint64) Executor {
