@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -10,16 +11,21 @@ import (
 )
 
 func main() {
-	fn := func () error {
+	fn := func (completed chan bool) error {
 		time.Sleep(1 * time.Second)
-		fmt.Println("Execution task done")
+		code := rand.Intn(100)
+		if code  > 90 {
+			fmt.Println("Error: ", code, " ", time.Now().Format("15:04:05"))
+			if (code % 2 == 0) {
+				completed <- true
+			}
+			return fmt.Errorf("Error")
+		}
+		fmt.Println("Success: ", code, " ", time.Now().Format("15:04:05"))
 		return nil
 	}
 
-	executor := executors.NewFixedExecutor(
-		20 * time.Second,
-		2,
-	)
+	executor := executors.NewFixedExecutor(60 * time.Second, 2)
 
 	// executor.Execute(context.Background(), fn)
 
@@ -50,8 +56,7 @@ func main() {
 
 	time.Sleep(6 * time.Second)
 	
-	fmt.Println("Stopping executor...")
-
+	// fmt.Println("Stopping executor...")
 	// executor.Stop()
 
 	wg.Wait()

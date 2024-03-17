@@ -20,7 +20,7 @@ type phasedExecutor struct {
 	mu sync.Mutex
 }
 
-func (e *phasedExecutor) Run(ctx context.Context, fn func() error) (ExecutorStats, error) {
+func (e *phasedExecutor) Run(ctx context.Context, fn func(chan bool) error) (ExecutorStats, error) {
 	// Check if the executor is already running
 	e.mu.Lock()
 	if e.status == running {
@@ -47,6 +47,7 @@ func (e *phasedExecutor) Run(ctx context.Context, fn func() error) (ExecutorStat
 	
 	var wg sync.WaitGroup
 	var requestCount, errorCount uint64
+	completedChannel := make(chan bool)
 
 	fmt.Println("Starting executor...")
 
@@ -59,15 +60,20 @@ func (e *phasedExecutor) Run(ctx context.Context, fn func() error) (ExecutorStat
 			}
 			e.mu.Unlock()
 			
-			wg.Add(1)
-			go func (ctx context.Context, s Stage) {
-				defer wg.Done()
-				iterationStats := e.runStage(ctx, s, fn)
-				atomic.AddUint64(&requestCount, iterationStats.requestCount)
-				atomic.AddUint64(&errorCount, iterationStats.errorCount)
-			}(ctx, stage)
-			
-			time.Sleep(stage.Duration)		
+			select {
+				case <-completedChannel:
+					break LOOP
+				default:
+					wg.Add(1)
+					go func (ctx context.Context, s Stage) {
+						defer wg.Done()
+						iterationStats := e.runStage(ctx, s, func() error { return fn(completedChannel) })
+						atomic.AddUint64(&requestCount, iterationStats.requestCount)
+						atomic.AddUint64(&errorCount, iterationStats.errorCount)
+					}(ctx, stage)
+					
+					time.Sleep(stage.Duration)		
+			}
 		}
 
 	wg.Wait()

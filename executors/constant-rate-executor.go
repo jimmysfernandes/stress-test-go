@@ -15,7 +15,7 @@ type constantRateExecutor struct {
 	mu sync.Mutex
 }
 
-func (e *constantRateExecutor) Run(ctx context.Context, fn func() error) (ExecutorStats, error) {
+func (e *constantRateExecutor) Run(ctx context.Context, fn func(chan bool) error) (ExecutorStats, error) {
 	e.mu.Lock()
 	if e.status == running {
 		defer e.mu.Unlock()
@@ -44,6 +44,7 @@ func (e *constantRateExecutor) Run(ctx context.Context, fn func() error) (Execut
 
 	var wg sync.WaitGroup
 	var startedIterations, requestCount, errorCount uint64
+	completedChannel := make(chan bool)
 
 	LOOP:
 		for {
@@ -56,12 +57,14 @@ func (e *constantRateExecutor) Run(ctx context.Context, fn func() error) (Execut
 			select {
 				case <-ctx.Done():
 					break LOOP
+				case <-completedChannel:
+					break LOOP
 				case <-ticker.C:
 					wg.Add(1)
 					atomic.AddUint64(&startedIterations, 1)
 					go func () {
 						defer wg.Done()
-						iterationStats := runIteration(ctx, e.requestPerSeccond, fn)
+						iterationStats := runIteration(ctx, e.requestPerSeccond, func() error { return fn(completedChannel) })
 						atomic.AddUint64(&requestCount, iterationStats.requestCount)
 						atomic.AddUint64(&errorCount, iterationStats.errorCount)
 					}()

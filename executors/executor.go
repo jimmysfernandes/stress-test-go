@@ -31,7 +31,7 @@ type iterationStats struct {
 }
 
 type Executor interface {
-	Run(ctx context.Context, fn func() error) (ExecutorStats, error)
+	Run(ctx context.Context, fn func(chan bool) error) (ExecutorStats, error)
 	Stop() error
 }
 
