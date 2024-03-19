@@ -1,1 +1,1 @@
-# stress-test-go
+# stress-test

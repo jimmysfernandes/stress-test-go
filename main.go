@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jimmysfernandes/stress-test/executors"
+	"github.com/jimmysfernandes/stress-test-go/executors"
 )
 
 func main() {
